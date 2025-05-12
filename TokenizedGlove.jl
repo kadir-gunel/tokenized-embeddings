@@ -157,10 +157,10 @@ function (glove::GloveBag)(w::T, c::T) where {T}
 end
 
 function createParamsBag(VSIZE::Int64, IN_DIM::Int64; init::Function=createUniform)
-    WE = EmbeddingBag(VSIZE => IN_DIM; init=Flux.identity_init(gain=100));
-    CE = EmbeddingBag(VSIZE => IN_DIM;init=Flux.identity_init(gain=100));
-    wbias = EmbeddingBag(VSIZE => 1; init=Flux.identity_init(gain=100));
-    cbias = EmbeddingBag(VSIZE => 1; init=Flux.identity_init(gain=100));
+    WE = EmbeddingBag(VSIZE => IN_DIM; init=Flux.identity_init(gain=5));
+    CE = EmbeddingBag(VSIZE => IN_DIM;init=Flux.identity_init(gain=5));
+    wbias = EmbeddingBag(VSIZE => 1; init=Flux.identity_init(gain=5));
+    cbias = EmbeddingBag(VSIZE => 1; init=Flux.identity_init(gain=5));
     return WE, CE, wbias, cbias
 end
 
@@ -289,6 +289,7 @@ function trainBag!(glove::GloveBag, train_data::DataLoader, opt_state; epochs::I
     generate_showvalues(epoch, loss) = () -> [(:Epoch, epoch), (:Loss,  loss)]
     normholder = Norm()
     ∇normholder = Norm()
+    batch = 1
     for epoch in 1:epochs
         trn_losses = Float32[];
         grads = []; ∇glove = nothing;
@@ -302,6 +303,8 @@ function trainBag!(glove::GloveBag, train_data::DataLoader, opt_state; epochs::I
             push!(trn_losses, loss_)
             accumulateNorm!(glove, normholder)
             accumulateNorm!(∇glove[1], ∇normholder)
+            println(batch, "/ $(length(train_data))")
+            batch += 1
         end
 
         push!(grads, ∇glove[1])
@@ -315,6 +318,7 @@ function trainBag!(glove::GloveBag, train_data::DataLoader, opt_state; epochs::I
         TBCallBack(glove, Float32(loss_), normholder)
 
         map(resetNorm!, [normholder, ∇normholder])
+        batch = 1
     end
 end
 
