@@ -14,7 +14,7 @@ ENV["JULIA_PYTHONCALL_EXE"] = "/home/kguenel/miniconda3/envs/tokenizers/bin/pyth
 
 cd(@__DIR__)
 using Pkg
-Pkg.activate("/home/kguenel/Glowe")
+Pkg.activate("/home/kguenel/Glove")
 
 using Dates
 using Logging
@@ -27,23 +27,20 @@ using Random
 
 Random.seed!(1234)
 
-# using OhMyREPL
+using OhMyREPL
 
 
 # using XLEs
 
 using CUDA
-# CUDA.device!(1)
+CUDA.device!(0)
 using Flux
 using Optimisers
 using Zygote
 
 
-using Flux: glorot_uniform, glorot_normal, kaiming_uniform,
-    kaiming_normal, truncated_normal, orthogonal, identity_init
-using Flux.Data: DataLoader
-using Flux: Embedding
-using Flux: Losses
+using Flux: DataLoader
+using Flux: @layer, create_bias
 using BSON: @save, @load
 using Test
 using ProgressMeter
@@ -103,21 +100,21 @@ struct Glove
     wbias::Embedding
     cbias::Embedding
 end
-Flux.@functor Glove
-
-function glove_loss(model::Glove, word::T, context::T, cooccurs::R, weight::R) where {T, R}
-    loss = model(word, context) - cooccurs
-    return mean((loss).^2 .* weight) * .5
-end
-
+@layer Glove
 
 function (glove::Glove)(w::T, c::T) where {T}
     words = glove.WE(w)
     context = glove.CE(c)
-    wbias = glove.wbias(w) |> permutedims
-    cbias = glove.cbias(c) |> permutedims
-    s = sum(words .* context, dims=1) |> permutedims
-    return s + wbias + cbias
+    wbias = glove.wbias(w) 
+    cbias = glove.cbias(c) 
+    s = sum(words .* context, dims=1)
+    return (s + wbias + cbias) |> vec
+end
+
+function loss(model::Glove, word::T, context::T, cooccurs::R, weight::R) where {T, R}
+    # t = 2 ; half = .5
+    loss = (model(word, context) .- cooccurs).^ 2
+    return mean(loss .* weight) * .5
 end
 
 
@@ -140,43 +137,30 @@ function createParams(VSIZE::Int64, IN_DIM::Int64; init::Function=createUniform)
     CE = Embedding(VSIZE, IN_DIM, init=init);
     wbias = Embedding(VSIZE, 1, init=init);
     cbias = Embedding(VSIZE, 1, init=init);
-    return WE, CE, wbias, cbias
+    return Glove(WE, CE, wbias, cbias)
 end
 
 
 function my_train!(glove::Glove, train_data::DataLoader, opt_state; epochs::Int=35)
-    loss_min = typemax(Float32)
-    epochs_no_improve = 0
-    n_epochs_stop = 5
-#    p = Progress(epochs; color=:darkblue, showspeed=true)
-#    generate_showvalues(epoch, loss) = () -> [(:Epoch, epoch), (:Loss,
-#    loss)]
+    p = Progress(epochs; color=:darkblue, showspeed=true)
+    generate_showvalues(epoch, loss) = () -> [(:Epoch, epoch), (:Loss, loss)]
     for epoch in 1:epochs
         trn_losses = Float32[];
-        attn_losses = Float32[];
         for(word, context, y, weight) in train_data
-            loss, ∇glove = Flux.withgradient(glove, word, context, y, weight) do g, wrd, ctx, y, wei
-                glove_loss(g, wrd |> gpu, ctx |> gpu, y |> gpu, wei |> gpu)
-                # glove_attention_loss(g, wrd |> gpu, ctx |> gpu)
+            word, context, y, weight =  (word, context, y, weight) .|> gpu
+            loss_, ∇glove = Flux.withgradient(glove, word, context, y, weight) do g, wrd, ctx, y, wei
+                # loss(g, wrd |> gpu, ctx |> gpu, y |> gpu, wei |> gpu)
+                loss(g, wrd, ctx, y, wei)
             end
-            opt_state, glove = Optimisers.update!(opt_state, glove, ∇glove[1]);
-
-            # att_loss = glove_attention_loss(glove, word |> gpu,
-            #  context |> gpu)
-
-            push!(trn_losses, loss)
-            # push!(attn_losses, att_loss)
+            Optimisers.update!(opt_state, glove, ∇glove[1]);
+            push!(trn_losses, loss_)
         end
 
-
-        # @printf "Epoch : %i \t Loss: %.6f\n" epoch mean(trn_losses)
-
-        @info "Epoch: $(epoch),
-        Loss: $(mean(trn_losses)), "
-        #         Attention Loss: $(mean(attn_losses)) "
+        # @info "Epoch: $(epoch),
+        # Loss: $(mean(trn_losses)), "
         # flush(log_file)
-        # ProgressMeter.next!(p; showvalues = generate_showvalues(epoch,
-        #                                                        mean(trn_losses)))
+        loss_ = mean(trn_losses)
+        next!(p; showvalues = generate_showvalues(epoch, loss_))
 
         # if mean(trn_losses) < loss_min
             # @printf "Saving model from epoch %i" epoch
@@ -210,7 +194,7 @@ distro = :glorot_uniform
 
 # distro = :kaiming_uniform
 
-root_file = "/mnt/nvme/github/GloVe/"
+root_file = "/mnt/depo/github/GloVe/"
 vfile = root_file * "vocab.txt"
 @info "Reading Vocabulary File : $(vfile)"
 vocab = split.(readlines(vfile), ' ')
@@ -223,7 +207,7 @@ V = vocab .|> first .|> string
 global XMAX = 10
 global ALPHA = .75
 global VSIZE = length(V)
-global IN_DIM = 100
+global IN_DIM = 64
 
 
 w2i = Dict(word => idx for (idx, word) in enumerate(V))
@@ -239,7 +223,7 @@ weights, log_occurs = get_weights(cooccurs);
 
 @info "Creating Training Data"
 # idx = randperm(MersenneTwister(1234), 30000000)
-global BSIZE =  div(length(left), 10000)
+global BSIZE =  div(length(left), 1000) # seems to be the optimal batch
 # global BSIZE =  div(length(left), 2000)
 train_data = DataLoader((left, right, log_occurs, weights), batchsize=BSIZE, partial=true, shuffle=true)
 # @info "Total Number of Batches: " div(length(left), BSIZE)
@@ -256,20 +240,19 @@ flush(log_file)
 
     @info "Creating Model"
     # or createWeight for gloVe style initialization
-    WE, CE, wbias, cbias = createParams(VSIZE, IN_DIM; init=eval(distro))
-    glove = Glove(WE, CE, wbias, cbias) |> gpu;
+    glove = createParams(VSIZE, IN_DIM; init=Flux.eval(distro)) |> gpu
+#     glove = Glove(WE, CE, wbias, cbias) |> gpu
     @info "Distro: $(distro)"
     @info "Setting Optimisers"
 
 
-    rule = Optimisers.OptimiserChain(Optimisers.ADAM(λ),
-                                     Optimisers.WeightDecay(1f-8),
-                                     Optimisers.ClipGrad(1e2));
+    rule = Optimisers.OptimiserChain(Optimisers.ADAM(λ))
+                                     # Optimisers.WeightDecay(1f-8),
+                                     # Optimisers.ClipGrad(1));
     opt_state = Optimisers.setup(rule, glove);
 
     @info "Started Training"
     my_train!(glove, train_data, opt_state, epochs=epochs)
-
 
 
     contextVectors = glove.CE.weight |> Array
