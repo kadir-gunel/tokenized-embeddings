@@ -34,6 +34,101 @@ rng = Random.default_rng()
 Random.seed!(rng, 0)
 
 
+using StatsBase
+
+
+struct NegativeSampler
+    words::Vector{String}
+    probs::Vector{Float64}
+    sample_size::Int
+    power::Float64
+    word_index::Dict{String,Int}
+end
+
+function NegativeSampler(word_counts::Dict{String,Int}; sample_size=5, power=0.75)
+    # Create sampling distribution
+    total = sum(count^power for count in values(word_counts))
+    words = collect(keys(word_counts))
+    probs = [count^power / total for count in values(word_counts)]
+    
+    # Create word to index mapping for faster lookup
+    word_index = Dict(word => i for (i, word) in enumerate(words))
+    
+    NegativeSampler(words, probs, sample_size, power, word_index)
+end
+
+function get_negative_samples(sampler::NegativeSampler, target_word::String; num_samples=nothing)
+    num_samples = isnothing(num_samples) ? sampler.sample_size : num_samples
+    
+    # Find target word index to exclude
+    target_idx = get(sampler.word_index, target_word, -1)
+    
+    # Create a probability vector excluding the target word
+    if target_idx > 0
+        adjusted_probs = copy(sampler.probs)
+        adjusted_probs[target_idx] = 0.0
+        adjusted_probs ./= sum(adjusted_probs)
+    else
+        adjusted_probs = sampler.probs
+    end
+    
+    # Sample according to adjusted probabilities
+    sample_indices = sample(1:length(sampler.words), Weights(adjusted_probs), num_samples; replace=false)
+    return sampler.words[sample_indices]
+end
+
+function update_counts!(sampler::NegativeSampler, word_counts::Dict{String,Int})
+    # Update the sampling distribution with new word counts
+    total = sum(count^sampler.power for count in values(word_counts))
+    sampler.probs .= [count^sampler.power / total for count in values(word_counts)]
+    
+    # Update word index if vocabulary changed
+    new_words = Set(keys(word_counts))
+    old_words = Set(sampler.words)
+    
+    if new_words != old_words
+        sampler.words = collect(keys(word_counts))
+        sampler.word_index = Dict(word => i for (i, word) in enumerate(sampler.words))
+    end
+end
+
+# Example usage
+if abspath(PROGRAM_FILE) == @__FILE__
+    # Example word counts (from your vocabulary)
+    word_counts = Dict(
+        "the" => 100,
+        "quick" => 30,
+        "brown" => 20,
+        "fox" => 15,
+        "jumps" => 10,
+        "over" => 25,
+        "lazy" => 18,
+        "dog" => 12, 
+        
+    )
+    
+    # Initialize negative sampler
+    sampler = NegativeSampler(word_counts, sample_size=25)
+    
+    # Get negative samples for a target word
+    target = "fox"
+@time    negative_samples = get_negative_samples(sampler, target);
+    println("Negative samples for '$target': ", negative_samples)
+    
+    # Update counts example
+    new_counts = copy(word_counts)
+    new_counts["cat"] = 8
+    new_counts["the"] = 105
+    update_counts!(sampler, new_counts)
+    
+    # Get new samples after update
+    new_negative_samples = get_negative_samples(sampler, target)
+    println("Negative samples after update: ", new_negative_samples)
+end
+
+
+### original implementation
+
 
 # Tokenize and prepare data
 function preprocess(corpus)
