@@ -23,7 +23,7 @@ Random.seed!(1234)
 # using XLEs
 
 using CUDA
-CUDA.device!(0)
+CUDA.device!(1)
 using Flux
 using Optimisers
 using Zygote
@@ -174,8 +174,9 @@ end
 Flux.@layer Glove
 
 function loss(model::Glove, word::T, context::T, cooccurs::R, weight::R) where {T, R}
-    loss = model(word, context) - cooccurs
-    return mean((loss).^2 .* weight) * .5
+    # t = 2 ; half = .5
+    loss = (model(word, context) - cooccurs).^ 2
+    return mean(loss .* weight) * .5
 end
 
 function (glove::Glove)(w::T, c::T) where {T}
@@ -435,7 +436,7 @@ dataloader = DataLoader((left_word, right_word, log_occurs, weights), batchsize=
 @info "Creating Bagging Model"
     # or createWeight for gloVe style initialization
 
-WE, CE, wbias, cbias = createParamsBag(VSIZE, IN_DIM; init=eval(distro))
+WE, CE, wbias, cbias = createParamsBags(VSIZE, IN_DIM; init=Flux.eval(distro))
 gloveBag = GloveBag(WE, CE, wbias, cbias) |> gpu;
 
 rule = Optimisers.OptimiserChain(Optimisers.ADAM(λ))
