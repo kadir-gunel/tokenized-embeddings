@@ -15,7 +15,7 @@ using CUDA
 using Flux
 using Zygote
 using Optimisers
-using Distributions
+using StatsBase
 
 
 using Flux: @layer
@@ -34,36 +34,46 @@ rng = Random.default_rng()
 Random.seed!(rng, 0)
 
 
-using StatsBase
+### multi-threaded negative sampler 
 
+
+xpower(x) = x^.75
 
 struct NegativeSampler
-    words::Vector{String}
+    vocab::Vector{Int}
     probs::Vector{Float64}
+    w2i::Dict{Int,Int}
+    rngs::Vector{MersenneTwister}  # One RNG per thread
     sample_size::Int
     power::Float64
-    word_index::Dict{String,Int}
+end 
+
+
+function NegativeSampler(corpus::Vector{Int}; sample_size=5, power=0.75)    
+    word_counts = frequencies(corpus)
+    vocab = collect(keys(word_counts))
+    counts = values(word_counts)
+    pow = xpower.(counts)
+    normalizer = reduce(+, pow) # normalizer for probability distro.
+    probs = pow ./ normalizer
+    w2i = Dict(word => i for (i, word) in enumerate(vocab))
+    # Initialize one RNG per thread
+    rngs = [MersenneTwister(rand(UInt)) for _ in 1:nthreads()]
+    @info "Negative Sampler Object is being generated..."
+    return NegativeSampler(vocab, probs, w2i, rngs, sample_size, power)
 end
 
-function NegativeSampler(word_counts::Dict{String,Int}; sample_size=5, power=0.75)
-    # Create sampling distribution
-    total = sum(count^power for count in values(word_counts))
-    words = collect(keys(word_counts))
-    probs = [count^power / total for count in values(word_counts)]
-    
-    # Create word to index mapping for faster lookup
-    word_index = Dict(word => i for (i, word) in enumerate(words))
-    
-    NegativeSampler(words, probs, sample_size, power, word_index)
-end
 
-function get_negative_samples(sampler::NegativeSampler, target_word::String; num_samples=nothing)
+
+function get_negative_samples(sampler::NegativeSampler, target_word::Int; num_samples=nothing)
     num_samples = isnothing(num_samples) ? sampler.sample_size : num_samples
+    target_idx = get(sampler.w2i, target_word, -1)
     
-    # Find target word index to exclude
-    target_idx = get(sampler.word_index, target_word, -1)
+    # Thread-safe sampling using threadid() to get the correct RNG
+    tid = threadid() 
+    local_rng = sampler.rngs[tid]
     
-    # Create a probability vector excluding the target word
+    # Create adjusted probabilities
     if target_idx > 0
         adjusted_probs = copy(sampler.probs)
         adjusted_probs[target_idx] = 0.0
@@ -72,72 +82,24 @@ function get_negative_samples(sampler::NegativeSampler, target_word::String; num
         adjusted_probs = sampler.probs
     end
     
-    # Sample according to adjusted probabilities
-    sample_indices = sample(1:length(sampler.words), Weights(adjusted_probs), num_samples; replace=false)
-    return sampler.words[sample_indices]
+    # Sample using thread-local RNG
+    sample_indices = sample(local_rng, 1:length(sampler.vocab), Weights(adjusted_probs), num_samples; replace=false)
+    return sampler.vocab[sample_indices]
 end
 
-function update_counts!(sampler::NegativeSampler, word_counts::Dict{String,Int})
-    # Update the sampling distribution with new word counts
-    total = sum(count^sampler.power for count in values(word_counts))
-    sampler.probs .= [count^sampler.power / total for count in values(word_counts)]
+
+function get_negative_samples_batch(sampler::NegativeSampler, target_words::Vector{Int}; num_samples=nothing)
+    num_samples = isnothing(num_samples) ? sampler.sample_size : num_samples
+    results = Vector{Vector{Int}}(undef, length(target_words))
     
-    # Update word index if vocabulary changed
-    new_words = Set(keys(word_counts))
-    old_words = Set(sampler.words)
-    
-    if new_words != old_words
-        sampler.words = collect(keys(word_counts))
-        sampler.word_index = Dict(word => i for (i, word) in enumerate(sampler.words))
+    @threads for i in eachindex(target_words)
+        results[i] = get_negative_samples(sampler, target_words[i]; num_samples)
     end
-end
-
-# Example usage
-if abspath(PROGRAM_FILE) == @__FILE__
-    # Example word counts (from your vocabulary)
-    word_counts = Dict(
-        "the" => 100,
-        "quick" => 30,
-        "brown" => 20,
-        "fox" => 15,
-        "jumps" => 10,
-        "over" => 25,
-        "lazy" => 18,
-        "dog" => 12, 
-        
-    )
     
-    # Initialize negative sampler
-    sampler = NegativeSampler(word_counts, sample_size=25)
-    
-    # Get negative samples for a target word
-    target = "fox"
-@time    negative_samples = get_negative_samples(sampler, target);
-    println("Negative samples for '$target': ", negative_samples)
-    
-    # Update counts example
-    new_counts = copy(word_counts)
-    new_counts["cat"] = 8
-    new_counts["the"] = 105
-    update_counts!(sampler, new_counts)
-    
-    # Get new samples after update
-    new_negative_samples = get_negative_samples(sampler, target)
-    println("Negative samples after update: ", new_negative_samples)
+    return reduce(hcat, results)
 end
 
 
-### original implementation
-
-
-# Tokenize and prepare data
-function preprocess(corpus)
-    words = split(lowercase(corpus))
-    vocab = Dict(word => i for (i, word) in enumerate(unique(words)))
-    idx_to_word = [word for (word, _) in sort(collect(vocab), by = x -> x[2])]
-    word_indices = [vocab[word] for word in words]
-    return word_indices, vocab, idx_to_word
-end
 
 get_frequencies(corpus::String)::Dict = frequencies(split(corpus))
 
@@ -154,103 +116,10 @@ function subsample_frequent_words(corpus::String)
 end
 
 
-"""
-# Generate skip-gram pairs
-function generate_pairs(corpus::String, w2i::Dict, word_indices; window_size=4, sample_size=8)
-    center = []; context = []; negs = []
-    neg_sampler = sample_negatives(corpus, w2i; sample_size=sample_size)
-    @showprogress for i in 1:length(word_indices)
-        fcontextWord = max(1, i - window_size)
-        lcontextWord = min(i + window_size, length(word_indices))
-        for j in fcontextWord:lcontextWord
-            if i != j
-                push!(center, word_indices[i])
-                push!(context, word_indices[j])
-                push!(negs, collect(first(neg_sampler)))
-            end
-        end
-    end
-    return center, context
-end
-"""
 
-function get_distribution(corpus::Vector{Int})
-    sample_probs = Dict{Int, Float32}()
-    wordCounts = frequencies(corpus)
-    normFactor = sum(v^.75 for v in values(wordCounts))
-    sample_probs = Dict(word => Float32(count^.75 / normFactor) for (word, count) in wordCounts)
-    vocab = wordCounts |> keys |> collect
-    probs = collect(sample_probs[w] for w in vocab)
-    dist = Categorical(probs)
-    return vocab, dist
-end
-
-"""
-function sample_negatives(corpus::Vector{T}, 
-                          center::Vector{R},
-                          context::Vector{R};
-                          sample_size::Int=25) where {T, R}
-
-    neg_samples = Vector{Vector{Int64}}(undef, length(center))
-    ucenter = center |> unique
-    vocab, distribution = get_distribution(corpus)
-
-    @showprogress for (id, cidx) in enumerate(ucenter)
-        forbiddens = unique(context[center .== cidx])
-        negs = Int64[]
-        while length(negs) < sample_size
-            w = vocab[rand(distribution)]
-            if !(w in forbiddens)
-                push!(negs, w)
-            end
-        end
-        neg_samples[id] = negs
-    end
-    return negs
-    # return repeated(vocab[rand(dist)] for _ in 1:sample_size)
-end
-"""
-
-function sample_negatives(corpus::Vector{Int}; sample_size::Int=25)
-    sample_probs = Dict{Int, Float32}()
-    wordCounts = frequencies(corpus)
-    normFactor = sum(v^.75 for v in values(wordCounts))
-    sample_probs = Dict(word => Float32(count^.75 / normFactor) for (word, count) in wordCounts)
-    vocab = wordCounts |> keys |> collect
-    probs = collect(sample_probs[w] for w in vocab)
-    dist = Categorical(probs)
-    return repeated(vocab[rand(dist)] for _ in 1:sample_size)
-end
-
-function sample_negatives(target, vocab::Vector{Int64}, distribution; sample_size::Int=25)
-    neg_samples = Int[]
-    while length(neg_samples) < sample_size
-        w = vocab[rand(dist)]
-        w != target ? push!(neg_samples, w) : nothing
-    end
-    return neg_samples
-end
-
-
-function generate_neg_samples(neg_samples; bsize::Int=64)
-    x = collect(first.(neg_samples.x) for _ in 1:bsize)
-    reduce(hcat, x)
-end
-
-function generate_neg_samplesMT(neg_samples; bsize::Int64)
-
-    x = Vector{Vector{eltype(first(neg_samples.x))}}(undef, bsize)
-    @threads for i in 1:bsize
-        x[i] = collect(first.(neg_samples.x))
-    end
-    reduce(hcat, x)
-
-end 
-
-function generate_pairs(corpus::Vector{Int}; window_size::Int=4) # , sample_size::Int=25)
+function positiveSampler(corpus::Vector{Int}; window_size::Int=4)
     tot_words = length(corpus)
-    center = Int32[]; context = Int32[]; # neg_samples = []
-    # vocab, distribution = get_distribution(corpus)
+    center = Int[]; context = Int[]; 
     @showprogress for i in 1:length(corpus)
         fcontextWord = max(1, i - window_size)
         lcontextWord = min(i + window_size, tot_words)
@@ -258,12 +127,14 @@ function generate_pairs(corpus::Vector{Int}; window_size::Int=4) # , sample_size
             if i != j
                 push!(center, corpus[i])
                 push!(context, corpus[j])
-                # push!(neg_samples, sample_negatives(corpus[j], vocab, distribution; sample_size=sample_size))
             end
         end
     end
-    return center, context # , neg_samples
+    return center, context
 end
+
+
+################# MODEL ###################
 
 struct Word2Vec
     V::Embedding
@@ -298,24 +169,6 @@ function loss(model::Word2Vec, center::V, context::V, neg_samples::M) where {V, 
 end
 
 
-# Forward + loss (negative sampling)
-function loss_fn(model::Word2Vec, center, context, negative_samples)
-    v_c = model.input_embeddings[:, center]
-    v_o = model.output_embeddings[:, context]
-
-    # Positive score
-    pos_score = log(sigmoid(dot(v_c, v_o)))
-
-    # Negative score
-    neg_score = 0.0
-    for neg in negative_samples
-        v_n = model.output_embeddings[:, neg]
-        neg_score += log(sigmoid(-dot(v_c, v_n)))
-    end
-
-    return - (pos_score + neg_score)
-end
-
 # Training loop
 function train!(model::Word2Vec, dataloader::DataLoader, neg_samples, opt_state; epochs=10)
     p = Progress(epochs; color=:darkblue, showspeed=true)
@@ -323,8 +176,8 @@ function train!(model::Word2Vec, dataloader::DataLoader, neg_samples, opt_state;
     bsize = dataloader.batchsize
     for epoch in 1:epochs
         trn_losses = Float32[];
-        negs = generate_neg_samplesMT(neg_samples; bsize=bsize)
         for(words, contexts) in dataloader
+            negs = get_negative_samples_batch(neg_samples, contexts; num_samples=10);
             words, contexts, negs =  (words, contexts, negs) .|> gpu
             loss_, ∇model = Flux.withgradient(model, words, contexts, negs) do m, wrd, ctx, negs
                 loss(m, wrd, ctx, negs)
@@ -339,12 +192,16 @@ function train!(model::Word2Vec, dataloader::DataLoader, neg_samples, opt_state;
 end
 
 
+################### MAIN ########################
+
 root_file = "/mnt/depo/github/GloVe/"
 text = root_file * "text8"
 
 corpus = read(text, String)
 
 filteredCorpus = subsample_frequent_words(corpus)
+
+
 vocab = filteredCorpus |> split |> unique .|> string
 
 w2i = Dict(word => idx for (idx, word) in enumerate(vocab))
@@ -355,31 +212,32 @@ intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 
 @info "Generating Positive Samples:"
-centers, contexts = generate_pairs(intCorpus, window_size=8)
+centers, contexts = positiveSampler(intCorpus, window_size=8)
 @info "Generator for Negative Samples is being generated"
-neg_samples = sample_negatives(intCorpus, sample_size=5);
+neg_samples = NegativeSampler(intCorpus, sample_size=10);
+
 
 
 VSIZE = length(vocab)
 
-model = Word2Vec(VSIZE, 128) |> gpu
+model = Word2Vec(VSIZE, 64) |> gpu
 
-rule = Optimisers.OptimiserChain(Optimisers.ADAM(1e-2))
+rule = Optimisers.OptimiserChain(Optimisers.ADAM(1e-3))
                                      # Optimisers.WeightDecay(1f-8),
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
 
-dataloader = DataLoader((centers, contexts), batchsize=1024*32, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=1024, shuffle=true, partial=false)
 
 ctr, ctx = first(dataloader)
-@time negs = generate_neg_samplesMT(neg_samples; bsize=1024 * 32);
+@time negs = get_negative_samples_batch(neg_samples, ctx; num_samples=10);
 
-ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
+ctr, ctx , negs = (ctr, ctx , negs) .|> cpu
 
 loss(model, ctr, ctx, negs)
 
 @time for _ in 1:1000
-    negs = generate_neg_samplesMT(neg_samples; bsize=1024 * 32);
+    negs = get_negative_samples_batch(neg_samples, ctx |> cpu ; num_samples=10);
     ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
     loss_, ∇model = Flux.withgradient(model, ctr, ctx, negs) do m, wrd, ctx, negs
                 loss(m, wrd, ctx, negs)
@@ -389,85 +247,6 @@ loss(model, ctr, ctx, negs)
 end
 
 
+train!(model, dataloader, neg_samples, opt_state; epochs=10)
 
-# Example usage
-corpus = "the quick brown fox jumps over the lazy dog"
-word_indices, vocab, idx_to_word = preprocess(corpus)
-pairs = generate_pairs(word_indices, 2)
-vocab_size = length(vocab)
-embed_dim = 10
-model = Word2Vec(vocab_size, embed_dim)
-train!(model, pairs, vocab_size, epochs=100, lr=0.05)
-
-# Getting embeddings
-embedding_matrix = model.input_embeddings
-
-
-
-
-
-
-"""
-
-struct Embedding{T}
-    W::T
-end
-
-Embedding(vocab_size::Integer, ex3mbedding_size::Integer) = Embedding(randn(Float32, embedding_size, vocab_size))
-@layer Embedding
-
-(m::Embedding)(x) = m.W[:, x]
-
-struct DotProduct{T}
-    fᵤ::T
-    fᵥ::T
-end
-
-@layer DotProduct
-
-(m::DotProduct)(x::Tuple{Integer,Integer}) = m.fᵤ(x[1]) ⋅ m.fᵥ(x[2])
-
-(m::DotProduct)(x,y) = sum(m.fᵤ(x) .* m.fᵥ(y))
-
-vocab_length = 10_000
-embedding_size = 16
-# function main(vocab_length = 10_000, embedding_size = 300)
-  encodder = Embedding(vocab_length, embedding_size)
-  decodder = Embedding(vocab_length, embedding_size)
-  model = DotProduct(encodder, decodder)
-  model_zip(x::Integer, y::Integer) = model((x, y))
-
-  opt = Flux.Optimise.Descent()
-
-  function loss(model,
-                target_word_index,
-                context_word_index,
-                negative_sample_word_indices)
-
-    l1 = - sum(log.(sigmoid.(model(target_word_index,
-                                   context_word_index))))
-
-    l2 = - sum(log.(sigmoid.(-model(target_word_index,
-                                    negative_sample_word_indices))))
-    l1 + l2
-  end
-
-
-#  @time begin
-#     for idx in 1:50
-        target_idx = rand(1:vocab_length)
-        context_idx = rand(1:vocab_length, 16)
-        neg_idx = rand(1:vocab_length, 16, 15)
-
-        ps = Flux.params(model)
-
-        gs = Flux.gradient(ps) do
-          l = loss(model, target_idx, context_idx, neg_idx)
-        end
-        Flux.Optimise.update!(opt, ps, gs)
-#    end
-#  end
-
-# end
-"""
 
