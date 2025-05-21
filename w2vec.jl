@@ -220,21 +220,24 @@ neg_samples = NegativeSampler(intCorpus, sample_size=10);
 
 VSIZE = length(vocab)
 
-model = Word2Vec(VSIZE, 64) |> gpu
+model = Word2Vec(VSIZE, 300) |> gpu
 
-rule = Optimisers.OptimiserChain(Optimisers.ADAM(1e-3))
+rule = Optimisers.OptimiserChain(Optimisers.ADAM(3e-4))
                                      # Optimisers.WeightDecay(1f-8),
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
 
-dataloader = DataLoader((centers, contexts), batchsize=1024, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=16, shuffle=true, partial=false)
 
 ctr, ctx = first(dataloader)
-@time negs = get_negative_samples_batch(neg_samples, ctx; num_samples=10);
 
-ctr, ctx , negs = (ctr, ctx , negs) .|> cpu
+vals_loss = []
+@showprogress for (ctr, ctx) in dataloader
+    negs = get_negative_samples_batch(neg_samples, ctx; num_samples=10);
+    ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
+    push!(vals_loss, loss(model, ctr, ctx, negs))
+end
 
-loss(model, ctr, ctx, negs)
 
 @time for _ in 1:1000
     negs = get_negative_samples_batch(neg_samples, ctx |> cpu ; num_samples=10);
