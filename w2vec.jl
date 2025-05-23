@@ -3,7 +3,6 @@ cd(@__DIR__)
 using Pkg
 Pkg.activate("/home/kguenel/Glove")
 
-
 using Random
 using .Iterators
 using .Threads
@@ -157,13 +156,13 @@ function loss(model::Word2Vec, center::V, context::V, neg_samples::M) where {V, 
 
     # inputs = reshape(inputs, 1, dsize, bsize) # (D, 1, B)
     # logsigmoid(dot(inputs, posouts))
-    pos_scores = sum(log.(sigmoid.(sum(dot(inputs, posouts))))) # scalar
-
+    # pos_scores = sum(log.(sigmoid.(sum(dot(inputs, posouts))))) # scalar
+    pos_scores = -logsigmoid(sum(inputs .* posouts, dims=1))
     # need to reshape the inputs
     dsize, bsize = size(inputs)
-    inputs = reshape(inputs, 1, dsize, bsize) # (D, 1, B)
-
-    neg_scores = sum(logsigmoid(-batched_mul(inputs, negouts)))
+    inputs = reshape(inputs, dsize, 1, bsize) # (D, 1, B)
+    negouts= permutedims(negouts, (1, 3, 2))
+    neg_scores = sum(logsigmoid(-batched_mul(inputs, negouts)), dims=3)
 
     return -(pos_scores + neg_scores) / bsize
 end
