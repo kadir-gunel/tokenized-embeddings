@@ -18,7 +18,7 @@ using StatsBase
 
 
 using Flux: @layer
-using Flux: frequencies, DataLoader
+using Flux: flatten, frequencies, DataLoader
 using BSON: @load, @save
 
 using ProgressMeter
@@ -103,13 +103,16 @@ end
 get_frequencies(corpus::String)::Dict = frequencies(split(corpus))
 
 
-function subsample_frequent_words(corpus::String)
+function subsample_frequent_words(corpus::String; minfreq::Int=10)
     filtered_corpus = String[]
     wordCounts = get_frequencies(corpus)
+    filter!(w -> w.second > minfreq, wordCounts)
     tot_wordCoutns = sum(values(wordCounts))
     wordCounts = Dict(word => wordCounts[word] / tot_wordCoutns for (word, _) in wordCounts)
     @showprogress for word in split(corpus)
-        rand() < (1 + sqrt(wordCounts[word] * 1e3)) * 1e-3 / wordCounts[word] ? push!(filtered_corpus, word) : nothing
+        if haskey(wordCounts, word)
+            rand() < (1 + sqrt(wordCounts[word] * 1e3)) * 1e-5 / wordCounts[word] ? push!(filtered_corpus, word) : nothing
+        end
     end
     return join(filtered_corpus, " ")
 end
@@ -157,14 +160,14 @@ function loss(model::Word2Vec, center::V, context::V, neg_samples::M) where {V, 
     # inputs = reshape(inputs, 1, dsize, bsize) # (D, 1, B)
     # logsigmoid(dot(inputs, posouts))
     # pos_scores = sum(log.(sigmoid.(sum(dot(inputs, posouts))))) # scalar
-    pos_scores = -logsigmoid(sum(inputs .* posouts, dims=1))
+    pos_scores = logsigmoid(sum(inputs .* posouts, dims=1))
     # need to reshape the inputs
     dsize, bsize = size(inputs)
-    inputs = reshape(inputs, dsize, 1, bsize) # (D, 1, B)
-    negouts= permutedims(negouts, (1, 3, 2))
-    neg_scores = sum(logsigmoid(-batched_mul(inputs, negouts)), dims=3)
+    inputs = reshape(inputs, 1, dsize, bsize) # (D, 1, B)
+    # negouts= permutedims(negouts, (1, 3, 2))
+    neg_scores = sum(logsigmoid(flatten(-batched_mul(inputs, negouts))), dims=1)
 
-    return -(pos_scores + neg_scores) / bsize
+    return -mean(pos_scores + neg_scores)
 end
 
 
@@ -198,7 +201,7 @@ text = root_file * "text8"
 
 corpus = read(text, String)
 
-filteredCorpus = subsample_frequent_words(corpus)
+filteredCorpus = subsample_frequent_words(corpus; minfreq=10)
 
 
 vocab = filteredCorpus |> split |> unique .|> string
@@ -211,7 +214,7 @@ intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 
 @info "Generating Positive Samples:"
-centers, contexts = positiveSampler(intCorpus, window_size=8)
+centers, contexts = positiveSampler(intCorpus, window_size=10)
 @info "Generator for Negative Samples is being generated"
 neg_samples = NegativeSampler(intCorpus, sample_size=10);
 
@@ -219,14 +222,14 @@ neg_samples = NegativeSampler(intCorpus, sample_size=10);
 
 VSIZE = length(vocab)
 
-model = Word2Vec(VSIZE, 300) |> gpu
+model = Word2Vec(VSIZE, 64) |> gpu
 
-rule = Optimisers.OptimiserChain(Optimisers.ADAM(3e-4))
+rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
                                      # Optimisers.WeightDecay(1f-8),
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
 
-dataloader = DataLoader((centers, contexts), batchsize=16, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=4096*8, shuffle=true, partial=false)
 
 ctr, ctx = first(dataloader)
 
@@ -249,6 +252,6 @@ end
 end
 
 
-train!(model, dataloader, neg_samples, opt_state; epochs=10)
+train!(model, dataloader, neg_samples, opt_state; epochs=5)
 
 
