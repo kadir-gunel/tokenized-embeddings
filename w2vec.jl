@@ -173,7 +173,7 @@ end
 
 # Training loop
 function train!(model::Word2Vec, dataloader::DataLoader, neg_samples, opt_state; epochs=10)
-    p = Progress(epochs; color=:darkblue, showspeed=true)
+    p = Progress(epochs; color=:white, showspeed=true)
     generate_showvalues(epoch, loss) = () -> [(:Epoch, epoch), (:Loss, loss)]
     bsize = dataloader.batchsize
     for epoch in 1:epochs
@@ -201,7 +201,7 @@ text = root_file * "text8"
 
 corpus = read(text, String)
 
-filteredCorpus = subsample_frequent_words(corpus; minfreq=10)
+filteredCorpus = subsample_frequent_words(corpus; minfreq=5)
 
 
 vocab = filteredCorpus |> split |> unique .|> string
@@ -229,7 +229,7 @@ rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
 
-dataloader = DataLoader((centers, contexts), batchsize=4096*8, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=4096, shuffle=true, partial=false)
 
 ctr, ctx = first(dataloader)
 
