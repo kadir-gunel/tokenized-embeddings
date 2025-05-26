@@ -3,6 +3,8 @@ cd(@__DIR__)
 using Pkg
 Pkg.activate("/home/kguenel/Glove")
 
+
+using Dates
 using Random
 using .Iterators
 using .Threads
@@ -15,7 +17,6 @@ using Flux
 using Zygote
 using Optimisers
 using StatsBase
-
 
 using Flux: @layer
 using Flux: flatten, frequencies, DataLoader
@@ -63,7 +64,6 @@ function NegativeSampler(corpus::Vector{Int}; sample_size=5, power=0.75)
 end
 
 
-
 function get_negative_samples(sampler::NegativeSampler, target_word::Int; num_samples=nothing)
     num_samples = isnothing(num_samples) ? sampler.sample_size : num_samples
     target_idx = get(sampler.w2i, target_word, -1)
@@ -97,7 +97,6 @@ function get_negative_samples_batch(sampler::NegativeSampler, target_words::Vect
     
     return reduce(hcat, results)
 end
-
 
 
 get_frequencies(corpus::String)::Dict = frequencies(split(corpus))
@@ -201,7 +200,7 @@ text = root_file * "text8"
 
 corpus = read(text, String)
 
-filteredCorpus = subsample_frequent_words(corpus; minfreq=5)
+filteredCorpus = subsample_frequent_words(corpus; minfreq=4)
 
 
 vocab = filteredCorpus |> split |> unique .|> string
@@ -224,12 +223,15 @@ VSIZE = length(vocab)
 
 model = Word2Vec(VSIZE, 64) |> gpu
 
-rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
+n = 8 # AccumGrad(n),
+rule = Optimisers.OptimiserChain(Optimisers.ADAM(7e-2))
+
+# rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
                                      # Optimisers.WeightDecay(1f-8),
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
 
-dataloader = DataLoader((centers, contexts), batchsize=4096, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=4096 * 64, shuffle=true, partial=false)
 
 ctr, ctx = first(dataloader)
 
@@ -241,14 +243,16 @@ vals_loss = []
 end
 
 
-@time for _ in 1:1000
-    negs = get_negative_samples_batch(neg_samples, ctx |> cpu ; num_samples=10);
+@time for (ctr, ctx) in dataloader
+    negs = get_negative_samples_batch(neg_samples, ctx; num_samples=10);
     ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
+    start_time = time()
     loss_, ∇model = Flux.withgradient(model, ctr, ctx, negs) do m, wrd, ctx, negs
                 loss(m, wrd, ctx, negs)
         end
     Optimisers.update!(opt_state, model, ∇model[1]);
-    println(loss_)
+    end_time = time()
+    @info "Loss: $(loss_), \t Tokens/sec : $(floor(length(ctx) / (end_time - start_time)))"
 end
 
 
