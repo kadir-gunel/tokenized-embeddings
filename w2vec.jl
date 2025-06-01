@@ -227,7 +227,7 @@ model = Word2Vec(VSIZE, 100) |> gpu
 # n = 8 # AccumGrad(n),
 # const lr = 1e-2
 rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
-                                 Optimisers.ADAM(.025) # (7e-2),
+                                 Optimisers.ADAM(.025), # (7e-2),
                                  Optimisers.ClipGrad(1),
                                  Optimisers.WeightDecay(1e-3))
 
@@ -269,8 +269,8 @@ end
 
 
 # train!(model, dataloader, neg_samples, opt_state; epochs=5)
-bsize = 4
-report_every = 100
+bsize = 4096 * 16
+report_every = 1
 initial_alpha = 0.025
 min_alpha = 0.0001
 iterations = collect(1:5)
