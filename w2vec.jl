@@ -4,7 +4,7 @@ using Pkg
 Pkg.activate("/home/kguenel/Glove")
 
 
-using Dates
+using .Libc
 using Random
 using .Iterators
 using .Threads
@@ -16,10 +16,12 @@ using CUDA
 using Flux
 using Zygote
 using Optimisers
+using ParameterSchedulers
 using StatsBase
 
 using Flux: @layer
 using Flux: flatten, frequencies, DataLoader
+using ParameterSchedulers: Scheduler
 using BSON: @load, @save
 
 using ProgressMeter
@@ -33,8 +35,8 @@ CUDA.device!(1)
 rng = Random.default_rng()
 Random.seed!(rng, 0)
 
-
 ### multi-threaded negative sampler 
+
 
 
 xpower(x) = x^.75
@@ -106,11 +108,12 @@ function subsample_frequent_words(corpus::String; minfreq::Int=10)
     filtered_corpus = String[]
     wordCounts = get_frequencies(corpus)
     filter!(w -> w.second > minfreq, wordCounts)
-    tot_wordCoutns = sum(values(wordCounts))
-    wordCounts = Dict(word => wordCounts[word] / tot_wordCoutns for (word, _) in wordCounts)
+    tot_wordCounts = sum(values(wordCounts))
+    # wordCounts = Dict(word => wordCounts[word] / tot_wordCounts for (word, _) in wordCounts)
     @showprogress for word in split(corpus)
         if haskey(wordCounts, word)
-            rand() < (1 + sqrt(wordCounts[word] * 1e3)) * 1e-5 / wordCounts[word] ? push!(filtered_corpus, word) : nothing
+            # rand() < (1 + sqrt(wordCounts[word] * 1e3)) * 1e-3 / wordCounts[word] ? push!(filtered_corpus, word) : nothing
+            rand() < (1 + sqrt(wordCounts[word] * 1e3 / tot_wordCounts)) * (1e-3 * tot_wordCounts) / wordCounts[word] ? push!(filtered_corpus, word) : nothing
         end
     end
     return join(filtered_corpus, " ")
@@ -202,7 +205,6 @@ corpus = read(text, String)
 
 filteredCorpus = subsample_frequent_words(corpus; minfreq=4)
 
-
 vocab = filteredCorpus |> split |> unique .|> string
 
 w2i = Dict(word => idx for (idx, word) in enumerate(vocab))
@@ -213,49 +215,127 @@ intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 
 @info "Generating Positive Samples:"
-centers, contexts = positiveSampler(intCorpus, window_size=10)
+centers, contexts = positiveSampler(intCorpus, window_size=5)
 @info "Generator for Negative Samples is being generated"
-neg_samples = NegativeSampler(intCorpus, sample_size=10);
-
+neg_samples = NegativeSampler(intCorpus, sample_size=5);
 
 
 VSIZE = length(vocab)
 
-model = Word2Vec(VSIZE, 64) |> gpu
+model = Word2Vec(VSIZE, 100) |> gpu
 
-n = 8 # AccumGrad(n),
-rule = Optimisers.OptimiserChain(Optimisers.ADAM(7e-2))
+# n = 8 # AccumGrad(n),
+# const lr = 1e-2
+rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
+                                 Optimisers.ADAM(.025) # (7e-2),
+                                 Optimisers.ClipGrad(1),
+                                 Optimisers.WeightDecay(1e-3))
 
 # rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
                                      # Optimisers.WeightDecay(1f-8),
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
+# sched = ParameterSchedulers.Stateful(Step(lr, 9e-1, 128))
 
-dataloader = DataLoader((centers, contexts), batchsize=4096 * 64, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=4096, shuffle=true, partial=false)
 
-ctr, ctx = first(dataloader)
+avgloss = Float32[]
+duration = Float32[]
+nextlr = lr
+@time for (iter, (ctr, ctx)) in enumerate(dataloader)
 
-vals_loss = []
-@showprogress for (ctr, ctx) in dataloader
-    negs = get_negative_samples_batch(neg_samples, ctx; num_samples=10);
-    ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
-    push!(vals_loss, loss(model, ctr, ctx, negs))
-end
-
-
-@time for (ctr, ctx) in dataloader
-    negs = get_negative_samples_batch(neg_samples, ctx; num_samples=10);
+    negs = get_negative_samples_batch(neg_samples, ctx; num_samples=5);
     ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
     start_time = time()
     loss_, ∇model = Flux.withgradient(model, ctr, ctx, negs) do m, wrd, ctx, negs
                 loss(m, wrd, ctx, negs)
         end
-    Optimisers.update!(opt_state, model, ∇model[1]);
     end_time = time()
-    @info "Loss: $(loss_), \t Tokens/sec : $(floor(length(ctx) / (end_time - start_time)))"
+    push!(duration, round(length(ctx) * (start_time/end_time), digits=3))
+    push!(avgloss, loss_)
+    if iter % 16 == 0
+        @info "Loss: $(round(mean(avgloss), digits=3)), \t Tokens/sec : $(mean(duration)) \t  LR: $(nextlr) \n"
+        empty!(duration)
+        empty!(avgloss)
+    end
+
+    Optimisers.update!(opt_state, model, ∇model[1]);
+    nextlr = ParameterSchedulers.next!(sched)
+    Optimisers.adjust!(opt_state, nextlr)
+    
+
+
 end
 
 
-train!(model, dataloader, neg_samples, opt_state; epochs=5)
+# train!(model, dataloader, neg_samples, opt_state; epochs=5)
+bsize = 4
+report_every = 100
+initial_alpha = 0.025
+min_alpha = 0.0001
+iterations = collect(1:5)
+processed_words = 0
+start_time = time()
+avgloss = Float32[]
+data_idx = collect(1:length(centers))
+for iter in iterations
+    #shuffle at each iteration
+    idx = shuffle!(data_idx)
+    data = collect(zip(centers[idx], contexts[idx]))
+
+    for i in collect(1:bsize:length(data))
+        batch = data[i:i+bsize-1]
+        ctr, ctx = first.(batch), last.(batch)
+        negs = get_negative_samples_batch(neg_samples, ctx; num_samples=5);
+        ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
+        loss_, ∇model = Flux.withgradient(model, ctr, ctx, negs) do m, wrd, ctx, negs
+                loss(m, wrd, ctx, negs)
+        end
+        processed_words += length(batch)
+        # linear learning rate decay
+        prog = (iter * length(data) + i) / (length(iterations) * length(data))
+        alpha = maximum([min_alpha, initial_alpha * (1 - prog)])
+        
+        
+        push!(avgloss, loss_)
+        Optimisers.update!(opt_state, model, ∇model[1]);
+        Optimisers.adjust!(opt_state, alpha)
+
+        if processed_words % report_every == 0
+            elapsed = time() - start_time
+            words_per_sec = processed_words / elapsed
+            remaining = (length(data) * length(iterations) - processed_words) / words_per_sec
+
+            @info " 
+            Iter : $(iter / length(iterations))\t
+            Alpha: $(alpha)\t
+            Loss: $(round(mean(avgloss), digits=3))\t
+            Progress: $(100 * prog)\t
+            words/sec: $(words_per_sec)\t
+            ETA: $(remaining)\n
+            "
+            empty!(avgloss)
+
+        end
+
+    end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
