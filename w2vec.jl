@@ -22,6 +22,7 @@ using Flux: @layer
 using Flux: flatten, frequencies, DataLoader
 using ParameterSchedulers: Scheduler
 using BSON: @load, @save
+using SafeTensors
 
 using ProgressMeter
 
@@ -448,6 +449,17 @@ for iter in iterations
 end
 
 
+U = model.U.weight
+V = model.V.weight
+
+params = Dict("U" => U, "V" => V)
+f = "path2word2vec.safetensors"
+SafeTensors.serialize(f, params)
+
+
+# for loading 
+
+loaded = SafeTensors.deserialize(f)
 
 
 
