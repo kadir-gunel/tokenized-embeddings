@@ -330,9 +330,9 @@ i2w = Dict(idx => word for (idx, word) in enumerate(vocab))
 intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 
-S_SIZE = 15
+S_SIZE = 25
 BSIZE =  4096 * 16 # 10_000 #4096 * 8
-DIMS = 256
+DIMS = 200
 
 @info "Generating Positive Samples:"
 centers, contexts = positiveSampler(intCorpus, window_size=8)
@@ -347,9 +347,9 @@ model = Word2Vec(VSIZE, DIMS) |> gpu
 # n = 8 # AccumGrad(n),
 # const lr = 1e-2
 rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
-                                 Optimisers.ADAM(5e-2),
-                                 Optimisers.ClipGrad(1),
-                                 Optimisers.WeightDecay(1e-3))
+                                 Optimisers.ADAM(25e-3), # (5e-2),
+                                 Optimisers.ClipGrad(1))
+                                 # Optimisers.WeightDecay(1e-3))
 
 # rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
                                      # Optimisers.WeightDecay(1f-8),
@@ -394,25 +394,26 @@ end
 
 
 # train!(model, dataloader, neg_samples, opt_state; epochs=5)
-bsize = 10_000 # 10_000_000
-report_every = 10_000
+bsize = 4096 * 64 # 10_000 # 10_000_000
+report_every = bsize
 initial_alpha = 25e-3
-min_alpha = 0.0001
-iterations = collect(1:5)
+min_alpha = 1e-4
+iterations = collect(0:4)
 processed_words = 0
 start_time = time()
 avgloss = Float32[]
 data_idx = collect(1:length(centers))
 for iter in iterations
     #shuffle at each iteration
+    @info "Iteration: $(iter)\n"
     idx = shuffle!(data_idx)
     data = collect(zip(centers[idx], contexts[idx]))
     outputs = vcat(ones(Int64, 1, bsize), zeros(Int64, S_SIZE, bsize))
-    for i in collect(1:bsize:length(data))
+    for i in collect(1:bsize:div(length(data), bsize) * bsize)
         batch = data[i:i+bsize-1]
         ctr, ctx = first.(batch), last.(batch)
         # negs = get_negative_samples_batch(neg_samples, ctx; num_samples=S_SIZE);
-        @time neg_ctx = get_negative_samples_cpu(sampler, Int32.(ctx));
+        neg_ctx = get_negative_samples_cpu(sampler, Int32.(ctx));
         ctx = vcat(permutedims(ctx), neg_ctx) # first row positive, rest rows negatives
         ctr, ctx, outputs = (ctr, ctx, outputs) |> gpu
         loss_, ∇model = Flux.withgradient(model, ctr, ctx, outputs) do m, ctr, ctx, outputs
@@ -434,7 +435,7 @@ for iter in iterations
             remaining = (length(data) * length(iterations) - processed_words) / words_per_sec
 
             @info " 
-            Iter : $(iter / length(iterations))\t
+            Iteration : $(iter) / $(length(iterations))\t
             Alpha: $(alpha)\t
             Loss: $(round(mean(avgloss), digits=3))\t
             Progress: $(100 * prog)\t
@@ -442,9 +443,7 @@ for iter in iterations
             ETA: $(remaining)\n
             "
             empty!(avgloss)
-
         end
-
     end
 end
 
