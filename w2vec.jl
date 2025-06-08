@@ -3,7 +3,6 @@ cd(@__DIR__)
 using Pkg
 Pkg.activate("/home/kguenel/Glove")
 
-
 using .Libc
 using Random
 using .Iterators
@@ -35,10 +34,127 @@ CUDA.device!(1)
 rng = Random.default_rng()
 Random.seed!(rng, 0)
 
+
+
+### faster negative sampler using Vose's algorithm
+struct CPUNegativeSampler
+    vocab::Vector{Int32}
+    probs::Vector{Float32}
+    alias_table::Tuple{Vector{Int32}, Vector{Float32}}
+    sample_size::Int32
+    power::Float32
+    rngs::Vector{MersenneTwister}  # One RNG per thread
+    w2i::Dict{Int32,Int32}
+end
+
+function CPUNegativeSampler(corpus::Vector{Int}; sample_size=5, power=0.75f0)
+    word_counts = frequencies(corpus)
+    vocab = Int32.(collect(keys(word_counts)))
+    counts = Float32.(collect(values(word_counts)))
+    
+    probs = counts .^ power
+    probs ./= sum(probs)
+    
+    alias_table = alias_setup(probs)
+    w2i = Dict(word => i for (i, word) in enumerate(vocab))
+    
+    # Initialize one RNG per thread
+    rngs = [MersenneTwister(rand(UInt)) for _ in 1:Threads.nthreads()]
+    
+    CPUNegativeSampler(
+        vocab,
+        probs,
+        alias_table,
+        Int32(sample_size),
+        Float32(power),
+        rngs,
+        w2i
+    )
+end
+
+function get_negative_samples_cpu(                                                                                                                                               
+           sampler::CPUNegativeSampler,                                                                                                                                                 
+           target_words::Vector{Int32};                                                                                                                                                 
+           num_samples=nothing                                                                                                                                                          
+       )                                                                                                                                                                                
+           num_samples = isnothing(num_samples) ? sampler.sample_size : Int32(num_samples)                                                                                              
+           batch_size = length(target_words)                                                                                                                                            
+           results = Matrix{Int32}(undef, num_samples, batch_size)                                                                                                                      
+                                                                                                                                                                                        
+           J, q = sampler.alias_table                                                                                                                                                   
+                                                                                                                                                                                        
+           Threads.@threads for i in 1:batch_size                                                                                                                                       
+               tid = Threads.threadid()                                                                                                                                                 
+               local_rng = sampler.rngs[tid]  # Thread-local RNG                                                                                                                        
+               target_idx = get(sampler.w2i, target_words[i], -1)                                                                                                                       
+                                                                                                                                                                                        
+               for j in 1:num_samples                                                                                                                                                   
+                   # Alias method sampling                                                                                                                                              
+                   u = rand(local_rng, Float32)                                                                                                                                         
+                   k = rand(local_rng, 1:length(sampler.vocab))                                                                                                                         
+                   idx = u < q[k] ? k : J[k]                                                                                                                                            
+                                                                                                                                                                                        
+                   # Rejection sampling for target word                                                                                                                                 
+                   while idx == target_idx                                                                                                                                              
+                       u = rand(local_rng, Float32)                                                                                                                                     
+                       k = rand(local_rng, 1:length(sampler.vocab))                                                                                                                     
+                       idx = u < q[k] ? k : J[k]                                                                                                                                        
+                   end                                                                                                                                                                  
+                                                                                                                                                                                        
+                   results[j, i] = sampler.vocab[idx]                                                                                                                                   
+               end                                                                                                                                                                      
+           end                                                                                                                                                                          
+                                                                                                                                                                                        
+           return results                                                                                                                                                               
+end                                     
+
+function alias_setup(probs::Vector{Float32})
+    n = length(probs)
+    J = Vector{Int32}(undef, n)  # Alias table
+    q = Vector{Float32}(undef, n) # Prob table
+    
+    # Use Vectors as stacks (with push!/pop!)
+    smaller = Int[]
+    larger = Int[]
+    
+    # Initialize
+    for i in 1:n
+        q[i] = probs[i] * n
+        if q[i] < 1.0f0
+            push!(smaller, i)
+        else
+            push!(larger, i)
+        end
+    end
+    
+    # Build alias table
+    while !isempty(smaller) && !isempty(larger)
+        small = pop!(smaller)
+        large = pop!(larger)
+        
+        J[small] = large
+        q[large] = q[large] - (1.0f0 - q[small])
+        
+        if q[large] < 1.0f0
+            push!(smaller, large)
+        else
+            push!(larger, large)
+        end
+    end
+    
+    # Handle remaining probabilities
+    for i in smaller
+        q[i] = 1.0f0
+    end
+    for i in larger
+        q[i] = 1.0f0
+    end
+    
+    return (J, q)
+end
+
+
 ### multi-threaded negative sampler 
-
-
-
 xpower(x) = x^.75
 
 struct NegativeSampler
@@ -49,7 +165,6 @@ struct NegativeSampler
     sample_size::Int
     power::Float64
 end 
-
 
 function NegativeSampler(corpus::Vector{Int}; sample_size=5, power=0.75)    
     word_counts = frequencies(corpus)
@@ -64,7 +179,6 @@ function NegativeSampler(corpus::Vector{Int}; sample_size=5, power=0.75)
     @info "Negative Sampler Object is being generated..."
     return NegativeSampler(vocab, probs, w2i, rngs, sample_size, power)
 end
-
 
 function get_negative_samples(sampler::NegativeSampler, target_word::Int; num_samples=nothing)
     num_samples = isnothing(num_samples) ? sampler.sample_size : num_samples
@@ -88,7 +202,6 @@ function get_negative_samples(sampler::NegativeSampler, target_word::Int; num_sa
     return sampler.vocab[sample_indices]
 end
 
-
 function get_negative_samples_batch(sampler::NegativeSampler, target_words::Vector{Int}; num_samples=nothing)
     num_samples = isnothing(num_samples) ? sampler.sample_size : num_samples
     results = Vector{Vector{Int}}(undef, length(target_words))
@@ -100,9 +213,7 @@ function get_negative_samples_batch(sampler::NegativeSampler, target_words::Vect
     return reduce(hcat, results)
 end
 
-
 get_frequencies(corpus::String)::Dict = frequencies(split(corpus))
-
 
 function subsample_frequent_words(corpus::String; minfreq::Int=10)
     filtered_corpus = String[]
@@ -118,8 +229,6 @@ function subsample_frequent_words(corpus::String; minfreq::Int=10)
     end
     return join(filtered_corpus, " ")
 end
-
-
 
 function positiveSampler(corpus::Vector{Int}; window_size::Int=4)
     tot_words = length(corpus)
@@ -152,7 +261,17 @@ function Word2Vec(VSIZE::Int, IN_DIM::Int)
     return Word2Vec(V, U)
 end
 
-(m::Word2Vec)(center, context, neg_samples) = m.V(center), m.U(context), m.U(neg_samples)
+# (m::Word2Vec)(center, context, neg_samples) = m.V(center), m.U(context), m.U(neg_samples)
+
+(m::Word2Vec)(center, context) = m.V(center), m.U(context)
+
+function newloss(model::Word2Vec, inputs::V, contexts::M, y::M) where {V, M}
+    inputs, contexts = model(inputs, contexts)
+    dim, bsize = inputs |> size
+    inputs = reshape(inputs, 1, dim, bsize)
+    ŷ = flatten(batched_mul(inputs, contexts))
+    return Flux.logitbinarycrossentropy(ŷ, y)
+end
 
 function loss(model::Word2Vec, center::V, context::V, neg_samples::M) where {V, M}
 
@@ -171,7 +290,6 @@ function loss(model::Word2Vec, center::V, context::V, neg_samples::M) where {V, 
 
     return -mean(pos_scores + neg_scores)
 end
-
 
 # Training loop
 function train!(model::Word2Vec, dataloader::DataLoader, neg_samples, opt_state; epochs=10)
@@ -202,9 +320,7 @@ root_file = "/mnt/depo/github/GloVe/"
 text = root_file * "text8"
 
 corpus = read(text, String)
-
 filteredCorpus = subsample_frequent_words(corpus; minfreq=4)
-
 vocab = filteredCorpus |> split |> unique .|> string
 
 w2i = Dict(word => idx for (idx, word) in enumerate(vocab))
@@ -214,20 +330,24 @@ i2w = Dict(idx => word for (idx, word) in enumerate(vocab))
 intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 
-@info "Generating Positive Samples:"
-centers, contexts = positiveSampler(intCorpus, window_size=5)
-@info "Generator for Negative Samples is being generated"
-neg_samples = NegativeSampler(intCorpus, sample_size=5);
+S_SIZE = 15
+BSIZE =  4096 * 16 # 10_000 #4096 * 8
+DIMS = 256
 
+@info "Generating Positive Samples:"
+centers, contexts = positiveSampler(intCorpus, window_size=8)
+@info "Generator for Negative Samples is being generated"
+sampler = CPUNegativeSampler(intCorpus, sample_size=S_SIZE);
+# neg_samples = NegativeSampler(intCorpus, sample_size=S_SIZE);
 
 VSIZE = length(vocab)
 
-model = Word2Vec(VSIZE, 100) |> gpu
+model = Word2Vec(VSIZE, DIMS) |> gpu
 
 # n = 8 # AccumGrad(n),
 # const lr = 1e-2
 rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
-                                 Optimisers.ADAM(.025), # (7e-2),
+                                 Optimisers.ADAM(5e-2),
                                  Optimisers.ClipGrad(1),
                                  Optimisers.WeightDecay(1e-3))
 
@@ -235,43 +355,48 @@ rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
                                      # Optimisers.WeightDecay(1f-8),
                                      # Optimisers.ClipGrad(1));
 opt_state = Optimisers.setup(rule, model);
-# sched = ParameterSchedulers.Stateful(Step(lr, 9e-1, 128))
+# sched = ParameterSchedulers.Stateful(Step(25e-3, 9e-1, 4))
 
-dataloader = DataLoader((centers, contexts), batchsize=4096, shuffle=true, partial=false)
+dataloader = DataLoader((centers, contexts), batchsize=BSIZE, shuffle=true, partial=false)
+
 
 avgloss = Float32[]
 duration = Float32[]
-nextlr = lr
-@time for (iter, (ctr, ctx)) in enumerate(dataloader)
+nextlr = 25e-3
+runnning_loss = 0.
 
-    negs = get_negative_samples_batch(neg_samples, ctx; num_samples=5);
-    ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
+y = vcat(ones(Int64, 1, BSIZE), zeros(Int64, S_SIZE, BSIZE))
+# y = reshape(y, S_SIZE + 1, 1, BSIZE)
+
+@time for (iter, (ctr, ctx)) in enumerate(dataloader)
+    # println("Iteration:", iter)
+    # negs = get_negative_samples_batch(neg_samples, ctx; num_samples=S_SIZE);
+    neg_ctx = get_negative_samples_cpu(sampler, Int32.(ctx));
+    ctx = vcat(permutedims(ctx), neg_ctx)
+    ctr, ctx, y = (ctr, ctx, y) |> gpu
     start_time = time()
-    loss_, ∇model = Flux.withgradient(model, ctr, ctx, negs) do m, wrd, ctx, negs
-                loss(m, wrd, ctx, negs)
-        end
+    loss_, ∇model = Flux.withgradient(model, ctr, ctx, y) do m, ctr, ctx, y 
+                newloss(m, ctr, ctx, y)
+    end
+    Optimisers.update!(opt_state, model, ∇model[1]);
     end_time = time()
     push!(duration, round(length(ctx) * (start_time/end_time), digits=3))
     push!(avgloss, loss_)
-    if iter % 16 == 0
-        @info "Loss: $(round(mean(avgloss), digits=3)), \t Tokens/sec : $(mean(duration)) \t  LR: $(nextlr) \n"
+    if iter % 1_000 == 0
+        @info "Loss: $(round(mean(avgloss), digits=3)), \t Tokens/sec : $(mean(duration))\n"
+        @info "$(iter / length(dataloader)) percent completed \n"
         empty!(duration)
         empty!(avgloss)
     end
-
-    Optimisers.update!(opt_state, model, ∇model[1]);
-    nextlr = ParameterSchedulers.next!(sched)
-    Optimisers.adjust!(opt_state, nextlr)
-    
-
-
+    # nextlr = ParameterSchedulers.next!(sched)
+    # Optimisers.adjust!(opt_state, nextlr)
 end
 
 
 # train!(model, dataloader, neg_samples, opt_state; epochs=5)
-bsize = 4096 * 16
-report_every = 1
-initial_alpha = 0.025
+bsize = 10_000 # 10_000_000
+report_every = 10_000
+initial_alpha = 25e-3
 min_alpha = 0.0001
 iterations = collect(1:5)
 processed_words = 0
@@ -282,14 +407,16 @@ for iter in iterations
     #shuffle at each iteration
     idx = shuffle!(data_idx)
     data = collect(zip(centers[idx], contexts[idx]))
-
+    outputs = vcat(ones(Int64, 1, bsize), zeros(Int64, S_SIZE, bsize))
     for i in collect(1:bsize:length(data))
         batch = data[i:i+bsize-1]
         ctr, ctx = first.(batch), last.(batch)
-        negs = get_negative_samples_batch(neg_samples, ctx; num_samples=5);
-        ctr, ctx , negs = (ctr, ctx , negs) .|> gpu
-        loss_, ∇model = Flux.withgradient(model, ctr, ctx, negs) do m, wrd, ctx, negs
-                loss(m, wrd, ctx, negs)
+        # negs = get_negative_samples_batch(neg_samples, ctx; num_samples=S_SIZE);
+        @time neg_ctx = get_negative_samples_cpu(sampler, Int32.(ctx));
+        ctx = vcat(permutedims(ctx), neg_ctx) # first row positive, rest rows negatives
+        ctr, ctx, outputs = (ctr, ctx, outputs) |> gpu
+        loss_, ∇model = Flux.withgradient(model, ctr, ctx, outputs) do m, ctr, ctx, outputs
+                newloss(m, ctr, ctx, outputs)
         end
         processed_words += length(batch)
         # linear learning rate decay
