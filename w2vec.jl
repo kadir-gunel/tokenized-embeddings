@@ -26,15 +26,82 @@ using SafeTensors
 
 using ProgressMeter
 
-using ExplainableAI
+# using ExplainableAI
 using TensorBoardLogger
 using TensorBoardLogger: with_logger
 
-CUDA.device!(1)
+CUDA.device!(0)
 
 rng = Random.default_rng()
 Random.seed!(rng, 0)
 
+mutable struct Norm
+    V::Float32
+    U::Float32
+    counter::Int32
+    Norm(V=.0, U=.0, counter=0) = new(V, U, counter)
+end
+
+function accumulateNorm!(model, n::Norm)
+    n.V = (model.V.weight |> norm) + n.V 
+    n.U = (model.U.weight |> norm) + n.U 
+    n.counter +=1 
+    return nothing 
+end
+
+function mapnorm!(f, n::Norm)
+    n.V = f(n.V)
+    n.U = f(n.U)
+    return n
+end
+
+function calculatNorm!(n::Norm)
+    counter = n.counter
+    n = mapnorm!(x -> x / counter, n )
+    return nothing
+end
+
+
+function resetNorm!(n::Norm)
+    n = mapnorm!(x -> x = 0., n)
+    n.counter = 0
+    return nothing
+end
+
+function fill_param_dict!(dict, m, prefix)
+    dict[prefix * "Center"] = m.V.weight
+    dict[prefix * "Context"] = m.U.weight
+    return nothing
+end
+
+function fill_norm_dict!(dict, normholder, prefix)
+    dict[prefix * "Center"] = normholder.V
+    dict[prefix * "Context"] = normholder.U
+    return nothing
+end
+
+function TBCallBack(model, loss_::Float32, normholder::Norm)
+    param_dict = Dict{String, Any}()
+    norm_dict = Dict{String, Any}()
+    fill_param_dict!(param_dict, model, "")
+    fill_norm_dict!(norm_dict, normholder, "")
+    with_logger(logger) do 
+        @info "Model" params=param_dict log_step_increment=1
+        @info "Train" params=loss_ log_step_increment=1
+        @info "Norm" params=norm_dict log_step_increment=1
+    end
+end
+
+function TBCallBackGrads(∇model, ∇normholder::Norm)
+    param_dict = Dict{String, Any}()
+    norm_dict = Dict{String, Any}()
+    fill_param_dict!(param_dict, ∇model, "∇")
+    fill_norm_dict!(norm_dict, ∇normholder, "∇")
+    with_logger(logger) do 
+        @info "∇Model" params=param_dict log_step_increment=1
+        @info "∇Norm" params=norm_dict log_step_increment=1
+    end
+end
 
 
 ### faster negative sampler using Vose's algorithm
@@ -270,8 +337,8 @@ function newloss(model::Word2Vec, inputs::V, contexts::M, y::M) where {V, M}
     inputs, contexts = model(inputs, contexts)
     dim, bsize = inputs |> size
     inputs = reshape(inputs, 1, dim, bsize)
-    ŷ = flatten(batched_mul(inputs, contexts))
-    return Flux.logitbinarycrossentropy(ŷ, y)
+    ŷ = flatten(batched_mul(inputs, contexts))
+    return Flux.logitbinarycrossentropy(ŷ, y)
 end
 
 function loss(model::Word2Vec, center::V, context::V, neg_samples::M) where {V, M}
@@ -321,7 +388,7 @@ root_file = "/mnt/depo/github/GloVe/"
 text = root_file * "text8"
 
 corpus = read(text, String)
-filteredCorpus = subsample_frequent_words(corpus; minfreq=4)
+filteredCorpus = subsample_frequent_words(corpus; minfreq=3)
 vocab = filteredCorpus |> split |> unique .|> string
 
 w2i = Dict(word => idx for (idx, word) in enumerate(vocab))
@@ -333,7 +400,7 @@ intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 S_SIZE = 25
 BSIZE =  4096 * 16 # 10_000 #4096 * 8
-DIMS = 200
+DIMS = 256
 
 @info "Generating Positive Samples:"
 centers, contexts = positiveSampler(intCorpus, window_size=8)
@@ -347,10 +414,10 @@ model = Word2Vec(VSIZE, DIMS) |> gpu
 
 # n = 8 # AccumGrad(n),
 # const lr = 1e-2
-rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
-                                 Optimisers.ADAM(25e-3), # (5e-2),
+λ = 25e-3 
+rule = Optimisers.OptimiserChain(Optimisers.AdamW(λ), # (5e-2),
                                  Optimisers.ClipGrad(1))
-                                 # Optimisers.WeightDecay(1e-3))
+                                 
 
 # rule = Optimisers.OptimiserChain(Optimisers.ADAM(2e-3))
                                      # Optimisers.WeightDecay(1f-8),
@@ -358,9 +425,9 @@ rule = Optimisers.OptimiserChain(# Optimisers.AccumGrad(16),
 opt_state = Optimisers.setup(rule, model);
 # sched = ParameterSchedulers.Stateful(Step(25e-3, 9e-1, 4))
 
-dataloader = DataLoader((centers, contexts), batchsize=BSIZE, shuffle=true, partial=false)
+# dataloader = DataLoader((centers, contexts), batchsize=BSIZE, shuffle=true, partial=false)
 
-
+"""
 avgloss = Float32[]
 duration = Float32[]
 nextlr = 25e-3
@@ -392,21 +459,27 @@ y = vcat(ones(Int64, 1, BSIZE), zeros(Int64, S_SIZE, BSIZE))
     # nextlr = ParameterSchedulers.next!(sched)
     # Optimisers.adjust!(opt_state, nextlr)
 end
+""" 
 
+root = pwd() * "/Documents/github/tokenized-embeddings/embeds/"
 
+# logger = TBLogger(root * "content/log_$(λ)")
 # train!(model, dataloader, neg_samples, opt_state; epochs=5)
 bsize = 4096 * 64 # 10_000 # 10_000_000
 report_every = bsize
-initial_alpha = 25e-3
+initial_alpha = λ
 min_alpha = 1e-4
 iterations = collect(0:4)
 processed_words = 0
 start_time = time()
 avgloss = Float32[]
+normholder = Norm()
+∇normholder = Norm()
 data_idx = collect(1:length(centers))
 for iter in iterations
     #shuffle at each iteration
     @info "Iteration: $(iter)\n"
+    grads = []; ∇model = nothing;
     idx = shuffle!(data_idx)
     data = collect(zip(centers[idx], contexts[idx]))
     outputs = vcat(ones(Int64, 1, bsize), zeros(Int64, S_SIZE, bsize))
@@ -425,10 +498,13 @@ for iter in iterations
         prog = (iter * length(data) + i) / (length(iterations) * length(data))
         alpha = maximum([min_alpha, initial_alpha * (1 - prog)])
         
-        
-        push!(avgloss, loss_)
         Optimisers.update!(opt_state, model, ∇model[1]);
         Optimisers.adjust!(opt_state, alpha)
+
+        # accumulateNorm!(model, normholder)
+        # accumulateNorm!(∇model[1], ∇normholder)
+
+        push!(avgloss, loss_)
 
         if processed_words % report_every == 0
             elapsed = time() - start_time
@@ -444,6 +520,16 @@ for iter in iterations
             ETA: $(remaining)\n
             "
             empty!(avgloss)
+
+            # push!(grads, ∇model[1])
+            # calculatNorm!(normholder)
+            # calculatNorm!(∇normholder)
+
+            # TBCallBackGrads(∇model[1], ∇normholder)
+            # TBCallBack(model, Float32(loss_), normholder)
+
+            # map(resetNorm!, [normholder, ∇normholder])
+            # resetNorm!(normholder)
         end
     end
 end
@@ -453,7 +539,7 @@ U = model.U.weight
 V = model.V.weight
 
 params = Dict("U" => U, "V" => V)
-f = "path2word2vec.safetensors"
+f = root * "word2vec_adam.safetensors"
 SafeTensors.serialize(f, params)
 
 
