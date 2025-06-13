@@ -400,7 +400,7 @@ intCorpus = collect(w2i[word] for word in split(filteredCorpus));
 
 S_SIZE = 25
 BSIZE =  4096 * 16 # 10_000 #4096 * 8
-DIMS = 256
+DIMS = 384
 
 @info "Generating Positive Samples:"
 centers, contexts = positiveSampler(intCorpus, window_size=8)
@@ -415,7 +415,7 @@ model = Word2Vec(VSIZE, DIMS) |> gpu
 # n = 8 # AccumGrad(n),
 # const lr = 1e-2
 λ = 25e-3 
-rule = Optimisers.OptimiserChain(Optimisers.AdamW(λ), # (5e-2),
+rule = Optimisers.OptimiserChain(Optimisers.RADAM(λ), # (5e-2),
                                  Optimisers.ClipGrad(1))
                                  
 
@@ -465,7 +465,7 @@ root = pwd() * "/Documents/github/tokenized-embeddings/embeds/"
 
 # logger = TBLogger(root * "content/log_$(λ)")
 # train!(model, dataloader, neg_samples, opt_state; epochs=5)
-bsize = 4096 * 64 # 10_000 # 10_000_000
+bsize = 4096 * 8 # 10_000 # 10_000_000
 report_every = bsize
 initial_alpha = λ
 min_alpha = 1e-4

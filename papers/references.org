@@ -1,1 +1,3 @@
 https://aegis4048.github.io/optimize_computational_efficiency_of_skip-gram_with_negative_sampling#How-are-negative-samples-drawn?
+https://arxiv.org/pdf/2502.13595
+
